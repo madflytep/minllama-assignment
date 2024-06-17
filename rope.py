@@ -1,5 +1,7 @@
 from typing import Tuple
 import torch
+import numpy as np
+
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
@@ -7,7 +9,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     for the purpose of broadcasting the frequency tensor during element-wise operations.
 
     Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
+        freqs_cls_cis (torch.Tensor): Frequency tensor to be reshaped.
         x (torch.Tensor): Target tensor for broadcasting compatibility.
 
     Returns:
@@ -22,6 +24,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
+
 
 def apply_rotary_emb(
     query: torch.Tensor,
@@ -47,29 +50,38 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
     """
-
     _, seqlen, _, _ = query.shape
     device = query.device
-    # todo
-    #
-    # Please refer to slide 22 in https://phontron.com/class/anlp2024/assets/slides/anlp-05-transformers.pdf
-    # and Section 3 in https://arxiv.org/abs/2104.09864.
 
-    # reshape xq and xk to match the complex representation
+    # Compute frequency tensor
     query_real, query_imag = query.float().reshape(query.shape[:-1] + (-1, 2)).unbind(-1)
     key_real, key_imag = key.float().reshape(key.shape[:-1] + (-1, 2)).unbind(-1)
-    # This separates each query/key vector into its odd and even indices (assuming *one-indexing*).
-    # query_real contains q_1, q_3, q_5, ... and query_imag contains q_2, q_4, q_6, ...
 
-    # First, compute the trigonometric values in the second and fourth columns in
-    # slide 22 (linked above).
+    freqs_cis = theta ** (-2 * torch.arange(0, head_dim / 2, device=device).float() / head_dim)
+    m = torch.arange(seqlen, device=device)
+    angles = torch.outer(m, freqs_cis).float()
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    cos = reshape_for_broadcast(cos, query_real)
+    sin = reshape_for_broadcast(sin, query_real)
 
-    # Then, combine these trigonometric values with the tensors query_real, query_imag,
-    # key_real, and key_imag.
+    query_out_1_real, query_out_1_imag = query_real * cos, query_imag * cos
+    query_out_2_real, query_out_2_imag = query_real * sin, -query_imag * sin
+    query_out_1 = query_out_1_real + query_out_2_imag
+    query_out_2 = query_out_1_imag + query_out_2_real
 
-    raise NotImplementedError
+    key_out_1_real, key_out_1_imag = key_real * cos, key_imag * cos
+    key_out_2_real, key_out_2_imag = key_real * sin, -key_imag * sin
+    key_out_1 = key_out_1_real + key_out_2_imag
+    key_out_2 = key_out_1_imag + key_out_2_real
 
-    query_out = None
-    key_out = None
-    # Return the rotary position embeddings for the query and key tensors
+    target = list(query_out_1.shape)
+    target[-1] = -1
+
+    query_stacked = torch.stack((query_out_1, query_out_2), dim=-1)
+    query_out = query_stacked.reshape(target)
+
+    key_stacked = torch.stack((key_out_1, key_out_2), dim=-1)
+    key_out = key_stacked.reshape(target)
+
     return query_out, key_out
